@@ -1,10 +1,10 @@
-export interface PlayerUrl {
+export type PlayerUrl = {
   id: string;
   text: string;
   file: string;
-}
+};
 
-export interface Anime {
+export type Anime = {
   id?: number;
   title: string;
   url: string;
@@ -14,4 +14,4 @@ export interface Anime {
   dubbedEpisodes: number;
   playerUrls: PlayerUrl[];
   lastUpdated: string;
-}
+};

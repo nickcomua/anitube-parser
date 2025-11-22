@@ -4,8 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start:bot": "bun bot_service.ts",
-    "start:scraper": "bun scraper_service.ts",
+    "start:bot": "bun bot-service.ts",
+    "start:scraper": "bun scraper-service.ts",
     "dev": "bun index.ts"
   },
   "devDependencies": {

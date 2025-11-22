@@ -1,7 +1,13 @@
-import { load } from "cheerio";
+import { type CheerioAPI, load } from "cheerio";
 import { ConvexHttpClient } from "convex/browser";
+import type { Element } from "domhandler";
 import { api } from "../convex/_generated/api";
 import type { Anime, PlayerUrl } from "./types";
+
+type PlaylistResponse = {
+  success: boolean;
+  response: string;
+};
 
 const BASE_URL = "https://anitube.in.ua";
 const USER_AGENT =
@@ -81,6 +87,94 @@ function isAnimeChanged(oldAnime: Anime, newAnime: Anime): boolean {
   return false;
 }
 
+function parsePlaylistItem(
+  $p: CheerioAPI,
+  el: Element
+): { id: string; file: string; text: string; epNum: string } | null {
+  const $el = $p(el);
+  const id = $el.attr("data-id");
+  const file = $el.attr("data-file");
+  const text = $el.text().trim();
+
+  if (!(id && file)) {
+    return null;
+  }
+
+  const epNumMatch = text.match(EPISODE_NUM_REGEX);
+  const epNum = epNumMatch?.[1] ? epNumMatch[1] : text;
+
+  return { id, file, text, epNum };
+}
+
+function processPlaylistItem(
+  item: { id: string; file: string; text: string; epNum: string },
+  uniqueSubs: Set<string>,
+  uniqueDubs: Set<string>,
+  playerUrls: PlayerUrl[]
+): void {
+  if (item.id.startsWith("0_0_")) {
+    uniqueDubs.add(item.epNum);
+  } else if (item.id.startsWith("0_1_")) {
+    uniqueSubs.add(item.epNum);
+  }
+
+  playerUrls.push({
+    id: item.id,
+    text: item.text,
+    file: item.file,
+  });
+}
+
+async function fetchAndParsePlaylist(
+  newsId: string,
+  userHash: string,
+  url: string
+): Promise<{ subbed: number; dubbed: number; playerUrls: PlayerUrl[] }> {
+  const playerUrls: PlayerUrl[] = [];
+  const uniqueSubs = new Set<string>();
+  const uniqueDubs = new Set<string>();
+
+  const ajaxUrl = `${BASE_URL}/engine/ajax/playlists.php`;
+  const params = new URLSearchParams({
+    news_id: newsId,
+    xfield: "playlist",
+    user_hash: userHash,
+  });
+
+  try {
+    const res = await fetch(`${ajaxUrl}?${params.toString()}`, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: url,
+      },
+    });
+
+    if (res.ok) {
+      const data = (await res.json()) as PlaylistResponse;
+      if (data.success && data.response) {
+        const $p = load(data.response);
+
+        const videos = $p(".playlists-videos .playlists-items li");
+        videos.each((_, el) => {
+          const item = parsePlaylistItem($p, el);
+          if (item) {
+            processPlaylistItem(item, uniqueSubs, uniqueDubs, playerUrls);
+          }
+        });
+      }
+    }
+  } catch (e) {
+    console.error(`Error fetching playlist for ${url}:`, e);
+  }
+
+  return {
+    subbed: uniqueSubs.size,
+    dubbed: uniqueDubs.size,
+    playerUrls,
+  };
+}
+
 /**
  * Parses anime details from a specific anime page URL.
  *
@@ -109,7 +203,7 @@ async function parseAnimeDetails(
       .text()
       .trim();
     let imageUrl = $(".story_post img").attr("src");
-    if (imageUrl && imageUrl.startsWith("/")) {
+    if (imageUrl?.startsWith("/")) {
       imageUrl = BASE_URL + imageUrl;
     }
 
@@ -121,63 +215,17 @@ async function parseAnimeDetails(
 
     let subbedEpisodes = 0;
     let dubbedEpisodes = 0;
-    const playerUrls: PlayerUrl[] = [];
+    let playerUrls: PlayerUrl[] = [];
 
     if (userHash && newsId) {
-      const ajaxUrl = `${BASE_URL}/engine/ajax/playlists.php`;
-      const params = new URLSearchParams({
-        news_id: newsId.toString(),
-        xfield: "playlist",
-        user_hash: userHash,
-      });
-
-      try {
-        const res = await fetch(`${ajaxUrl}?${params.toString()}`, {
-          headers: {
-            "User-Agent": USER_AGENT,
-            "X-Requested-With": "XMLHttpRequest",
-            Referer: url,
-          },
-        });
-
-        if (res.ok) {
-          const data = (await res.json()) as any;
-          if (data.success && data.response) {
-            const $p = load(data.response);
-
-            const uniqueSubs = new Set<string>();
-            const uniqueDubs = new Set<string>();
-
-            const videos = $p(".playlists-videos .playlists-items li");
-            videos.each((_, el) => {
-              const id = $p(el).attr("data-id");
-              const file = $p(el).attr("data-file");
-              const text = $p(el).text().trim();
-
-              if (id) {
-                const epNumMatch = text.match(EPISODE_NUM_REGEX);
-                const epNum =
-                  epNumMatch && epNumMatch[1] ? epNumMatch[1] : text;
-
-                if (id.startsWith("0_0_")) {
-                  uniqueDubs.add(epNum);
-                } else if (id.startsWith("0_1_")) {
-                  uniqueSubs.add(epNum);
-                }
-
-                if (file) {
-                  playerUrls.push({ id, text, file });
-                }
-              }
-            });
-
-            subbedEpisodes = uniqueSubs.size;
-            dubbedEpisodes = uniqueDubs.size;
-          }
-        }
-      } catch (e) {
-        console.error(`Error fetching playlist for ${url}:`, e);
-      }
+      const playlistData = await fetchAndParsePlaylist(
+        newsId.toString(),
+        userHash,
+        url
+      );
+      subbedEpisodes = playlistData.subbed;
+      dubbedEpisodes = playlistData.dubbed;
+      playerUrls = playlistData.playerUrls;
     }
 
     if (subbedEpisodes === 0 && dubbedEpisodes === 0) {
@@ -205,6 +253,34 @@ async function parseAnimeDetails(
   }
 }
 
+async function processAnime(
+  convexClient: ConvexHttpClient,
+  link: string,
+  title: string
+): Promise<"UPDATED" | "UNCHANGED"> {
+  const newAnime = await parseAnimeDetails(link, title);
+
+  if (newAnime) {
+    const existingAnime = (await convexClient.query(api.animes.getByUrl, {
+      url: newAnime.url,
+    })) as unknown as Anime | null;
+
+    let hasChanged = true;
+    if (existingAnime) {
+      hasChanged = isAnimeChanged(existingAnime, newAnime);
+    }
+
+    if (hasChanged) {
+      console.log(`Update detected for ${title}. Upserting...`);
+      await convexClient.mutation(api.animes.upsert, newAnime);
+      return "UPDATED";
+    }
+    console.log(`No changes for ${title}.`);
+    return "UNCHANGED";
+  }
+  return "UNCHANGED";
+}
+
 /**
  * Scans a single page of the anime list.
  *
@@ -218,6 +294,50 @@ async function parseAnimeDetails(
  * @param stopOptions - Options for the stop condition (limit and current count).
  * @returns Object containing processing stats and stop signal.
  */
+function handleScanError(
+  e: unknown,
+  page: number,
+  stopOptions: { consecutiveUnchanged: number }
+): { processed: number; consecutiveUnchanged: number; stop: boolean } {
+  const err = e instanceof Error ? e : new Error(String(e));
+  if (err.message.includes("404")) {
+    console.log(`Page ${page} not found.`);
+    return {
+      processed: 0,
+      consecutiveUnchanged: stopOptions.consecutiveUnchanged,
+      stop: true,
+    };
+  }
+  console.error(`Error scanning page ${page}:`, e);
+  return {
+    processed: 0,
+    consecutiveUnchanged: stopOptions.consecutiveUnchanged,
+    stop: false,
+  };
+}
+
+function processAnimeItem(
+  result: "UPDATED" | "UNCHANGED",
+  processed: number,
+  currentConsecutiveUnchanged: number,
+  limit: number
+): { processed: number; consecutiveUnchanged: number; shouldStop: boolean } {
+  if (result === "UPDATED") {
+    return {
+      processed: processed + 1,
+      consecutiveUnchanged: 0,
+      shouldStop: false,
+    };
+  }
+
+  const newConsecutiveUnchanged = currentConsecutiveUnchanged + 1;
+  return {
+    processed,
+    consecutiveUnchanged: newConsecutiveUnchanged,
+    shouldStop: newConsecutiveUnchanged >= limit,
+  };
+}
+
 export async function scanPage(
   page: number,
   stopOptions: { consecutiveUnchanged: number; limit: number }
@@ -251,38 +371,26 @@ export async function scanPage(
       const title = linkEl.text().trim();
 
       if (link && title) {
-        const newAnime = await parseAnimeDetails(link, title);
+        const result = await processAnime(client, link, title);
+        const update = processAnimeItem(
+          result,
+          processed,
+          currentConsecutiveUnchanged,
+          stopOptions.limit
+        );
 
-        if (newAnime) {
-          const existingAnime = (await client.query(api.animes.getByUrl, {
-            url: newAnime.url,
-          })) as unknown as Anime | null;
+        processed = update.processed;
+        currentConsecutiveUnchanged = update.consecutiveUnchanged;
 
-          let hasChanged = true;
-          if (existingAnime) {
-            hasChanged = isAnimeChanged(existingAnime, newAnime);
-          }
-
-          if (hasChanged) {
-            console.log(`Update detected for ${title}. Upserting...`);
-            await client.mutation(api.animes.upsert, newAnime);
-            processed += 1;
-            currentConsecutiveUnchanged = 0;
-          } else {
-            console.log(`No changes for ${title}.`);
-            currentConsecutiveUnchanged += 1;
-          }
-
-          if (currentConsecutiveUnchanged >= stopOptions.limit) {
-            console.log(
-              `Reached limit of ${stopOptions.limit} unchanged items. Stopping.`
-            );
-            return {
-              processed,
-              consecutiveUnchanged: currentConsecutiveUnchanged,
-              stop: true,
-            };
-          }
+        if (update.shouldStop) {
+          console.log(
+            `Reached limit of ${stopOptions.limit} unchanged items. Stopping.`
+          );
+          return {
+            processed,
+            consecutiveUnchanged: currentConsecutiveUnchanged,
+            stop: true,
+          };
         }
         await new Promise((r) => setTimeout(r, 2000));
       }
@@ -293,21 +401,7 @@ export async function scanPage(
       stop: false,
     };
   } catch (e: unknown) {
-    const err = e as any;
-    if (err?.message?.includes("404")) {
-      console.log(`Page ${page} not found.`);
-      return {
-        processed: 0,
-        consecutiveUnchanged: stopOptions.consecutiveUnchanged,
-        stop: true,
-      };
-    }
-    console.error(`Error scanning page ${page}:`, e);
-    return {
-      processed: 0,
-      consecutiveUnchanged: stopOptions.consecutiveUnchanged,
-      stop: false,
-    };
+    return handleScanError(e, page, stopOptions);
   }
 }
 
