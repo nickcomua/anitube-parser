@@ -1,0 +1,7 @@
+node_modules
+.git
+.cursor
+terminals
+.DS_Store
+*.log
+

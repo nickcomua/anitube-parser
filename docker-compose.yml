@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    command: bun run start:bot
+    environment:
+      - TELEGRAM_BOT_TOKEN
+      - CONVEX_URL
+    restart: unless-stopped
+
+  scraper:
+    build: .
+    command: bun run start:scraper
+    environment:
+      - CONVEX_URL
+    restart: unless-stopped
+
